@@ -1,8 +1,9 @@
 import { readFile } from "fs/promises";
-import { resolve } from "path";
+import { resolve, basename } from "path";
 import { homedir } from "os";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { readSchema, MAX_LINES, paginateLines } from "./shared.js";
+import { crushJson, isJson, compressCode, isSourceFile } from "../compression/index.js";
 
 function resolvePath(path: string, cwd: string): string {
 	if (path.startsWith("~/") || path === "~") {
@@ -50,6 +51,24 @@ export function createReadTool(cwd: string): AgentTool<typeof readSchema> {
 			if (page.hasMore) {
 				const nextOffset = page.shownRange[1] + 1;
 				result += `\n\n[Showing lines ${page.shownRange[0]}-${page.shownRange[1]} of ${page.totalLines}. Use offset=${nextOffset} to continue.]`;
+			}
+
+			// Apply compression only on full reads (no offset/limit) to avoid
+			// corrupting paginated output the user is navigating through
+			if (!offset && !limit) {
+				const filename = basename(path);
+
+				if (isJson(result)) {
+					const { compressed, reductionPct } = crushJson(result);
+					if (reductionPct > 0) {
+						result = compressed + `\n\n[SmartCrusher: −${reductionPct}% tokens]`;
+					}
+				} else if (isSourceFile(filename)) {
+					const { compressed, reductionPct, language } = compressCode(result, filename);
+					if (reductionPct > 0) {
+						result = compressed + `\n\n[CodeCompressor (${language}): −${reductionPct}% tokens]`;
+					}
+				}
 			}
 
 			return {
