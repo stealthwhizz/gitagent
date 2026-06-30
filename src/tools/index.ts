@@ -45,7 +45,7 @@ export function createBuiltinTools(config: BuiltinToolsConfig): AgentTool<any>[]
 
 	const tools: AgentTool<any>[] = [
 		createCliTool(config.dir, config.timeout),
-		createReadTool(config.dir),
+		createReadTool(config.dir, config.costTracker, config.docStore),
 		createWriteTool(config.dir),
 		createEditTool(config.dir),
 		createMemoryTool(config.dir, config.pluginMemoryLayers),

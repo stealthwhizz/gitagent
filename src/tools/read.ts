@@ -1,9 +1,15 @@
-import { readFile } from "fs/promises";
-import { resolve, basename } from "path";
+import { readFile, writeFile, mkdir, stat } from "fs/promises";
+import { resolve, basename, join } from "path";
 import { homedir } from "os";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { readSchema, MAX_LINES, paginateLines } from "./shared.js";
 import { crushJson, isJson, compressCode, isSourceFile } from "../compression/index.js";
+import { convertToMarkdown, isConvertible } from "./doc-converter.js";
+import { DocStore, chunkDocument } from "./doc-store.js";
+import type { CostTracker } from "../cost-tracker.js";
+
+const CCR_THRESHOLD_TOKENS = 8000;
+const DOC_CACHE_DIR = "memory/.doc-cache";
 
 function resolvePath(path: string, cwd: string): string {
 	if (path.startsWith("~/") || path === "~") {
@@ -21,11 +27,51 @@ function isBinary(buffer: Buffer): boolean {
 	return false;
 }
 
-export function createReadTool(cwd: string): AgentTool<typeof readSchema> {
+function estimateTokens(s: string): number {
+	return Math.ceil(s.length / 4);
+}
+
+function cacheKey(absolutePath: string): string {
+	return absolutePath.replace(/[/\\:]/g, "_") + ".md";
+}
+
+async function loadFromCache(cwd: string, absolutePath: string): Promise<string | null> {
+	try {
+		const key = cacheKey(absolutePath);
+		const cachePath = join(cwd, DOC_CACHE_DIR, key);
+		const [cacheStat, sourceStat] = await Promise.all([
+			stat(cachePath).catch(() => null),
+			stat(absolutePath).catch(() => null),
+		]);
+		if (!cacheStat || !sourceStat) return null;
+		// Invalidate if source is newer than cache
+		if (sourceStat.mtimeMs > cacheStat.mtimeMs) return null;
+		return await readFile(cachePath, "utf-8");
+	} catch {
+		return null;
+	}
+}
+
+async function saveToCache(cwd: string, absolutePath: string, markdown: string): Promise<void> {
+	try {
+		const cacheDir = join(cwd, DOC_CACHE_DIR);
+		await mkdir(cacheDir, { recursive: true });
+		const key = cacheKey(absolutePath);
+		await writeFile(join(cacheDir, key), markdown, "utf-8");
+	} catch {
+		// Cache write failure is non-fatal
+	}
+}
+
+export function createReadTool(
+	cwd: string,
+	costTracker?: CostTracker,
+	docStore?: DocStore,
+): AgentTool<typeof readSchema> {
 	return {
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. Output is limited to ${MAX_LINES} lines or ~100KB. Use offset/limit for large files.`,
+		description: `Read the contents of a file. Output is limited to ${MAX_LINES} lines or ~100KB. Use offset/limit for large files. Supports PDF, DOCX, XLSX, PPTX — converted to markdown automatically.`,
 		parameters: readSchema,
 		execute: async (
 			_toolCallId: string,
@@ -37,13 +83,60 @@ export function createReadTool(cwd: string): AgentTool<typeof readSchema> {
 			const absolutePath = resolvePath(path, cwd);
 			const buffer = await readFile(absolutePath);
 
+			// ── Stage 1: Document conversion ──────────────────────────────
+			// Convert binary docs (PDF, DOCX, XLSX, PPTX) to markdown.
+			// Binary files that are NOT convertible return a placeholder.
 			if (isBinary(buffer)) {
+				if (!isConvertible(path)) {
+					return {
+						content: [{ type: "text", text: `[Binary file: ${path} (${buffer.length} bytes)]` }],
+						details: undefined,
+					};
+				}
+
+				// Check cache first — skip conversion if cached copy is fresh
+				let markdown = await loadFromCache(cwd, absolutePath);
+				let fromCache = true;
+
+				if (!markdown) {
+					fromCache = false;
+					const result = await convertToMarkdown(absolutePath, buffer);
+					if (!result) {
+						return {
+							content: [{ type: "text", text: `[Binary file: ${path} (${buffer.length} bytes) — conversion failed]` }],
+							details: undefined,
+						};
+					}
+					markdown = result.markdown;
+					if (costTracker) costTracker.addConversion(result.savedTokens);
+					await saveToCache(cwd, absolutePath, markdown);
+				}
+
+				const cacheNote = fromCache ? " (from cache)" : "";
+
+				// ── Stage 2b: CCR chunking for large docs ──────────────────
+				// If doc exceeds threshold and a docStore is available, return
+				// an outline and let the agent fetch sections on demand.
+				if (docStore && estimateTokens(markdown) > CCR_THRESHOLD_TOKENS) {
+					const chunks = chunkDocument(markdown);
+					docStore.store(absolutePath, chunks);
+					const outline = docStore.getOutline(absolutePath)!;
+					return {
+						content: [{
+							type: "text",
+							text: `[${path}${cacheNote} — ${chunks.length} sections, too large to show in full]\n\nUse \`read_doc_section\` with a section ID to read any section.\n\n${outline}`,
+						}],
+						details: undefined,
+					};
+				}
+
 				return {
-					content: [{ type: "text", text: `[Binary file: ${path} (${buffer.length} bytes)]` }],
+					content: [{ type: "text", text: `[Converted from binary${cacheNote}]\n\n${markdown}` }],
 					details: undefined,
 				};
 			}
 
+			// ── Plain text file ────────────────────────────────────────────
 			const text = buffer.toString("utf-8");
 			const page = paginateLines(text, offset, limit);
 			let result = page.text;
@@ -53,8 +146,9 @@ export function createReadTool(cwd: string): AgentTool<typeof readSchema> {
 				result += `\n\n[Showing lines ${page.shownRange[0]}-${page.shownRange[1]} of ${page.totalLines}. Use offset=${nextOffset} to continue.]`;
 			}
 
-			// Apply compression only on full reads (no offset/limit) to avoid
-			// corrupting paginated output the user is navigating through
+			// ── Stage 2a: Compression passes ──────────────────────────────
+			// Apply only on full reads (no offset/limit) to avoid corrupting
+			// paginated output the user is navigating through.
 			if (!offset && !limit) {
 				const filename = basename(path);
 
