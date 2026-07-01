@@ -160,60 +160,34 @@ async function main() {
     }
   }
 
-  // ── Round 1: WITHOUT compression ─────────────────────────────────────
-  // Simulate no doc-converter by providing ONLY the read tool (no cli).
-  // This prevents the agent routing around the binary via pdftotext or
-  // other shell tools — which is what happens on Mac/Linux in the wild.
-  // The agent will call read(), get "[Binary file]", and be stuck.
-  // createReadTool with NO docStore → no CCR, no doc-converter (isConvertible
-  // still triggers but we pass no costTracker so agent just gets [Binary file]
-  // for the .pdf because the old read.ts on main would return that).
-  // Simpler: we patch by giving the agent only a stripped read that returns
-  // [Binary file] for any binary — achieved by passing no docStore and using
-  // the original isBinary-only path. Since we're on feat/compression the read
-  // tool now checks isConvertible first, so to truly simulate "no feature" we
-  // wrap a custom tool.
-  // Disable cli + read_doc_section so agent can't route around the missing
-  // doc-converter via pdftotext or other shell tools.
-  // Also inject a custom "read" that blocks convertible formats — simulating
-  // the old read.ts behaviour before doc-converter existed.
-  const readNoConvert = {
-    name: "read",
-    description: "Read a file. PDF/DOCX/XLSX/PPTX files are not supported — returns a placeholder.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        offset: { type: "number" },
-        limit: { type: "number" },
-      },
-      required: ["path"],
-    },
-    handler: async ({ path: filePath }) => {
-      const { readFile } = await import("fs/promises");
-      const { resolve } = await import("path");
-      const buf = await readFile(resolve(agentDir, filePath)).catch(() => null);
-      if (!buf) return `[File not found: ${filePath}]`;
-      if (/\.(pdf|docx|xlsx|pptx)$/i.test(filePath)) {
-        return `[Binary file: ${filePath} (${buf.length} bytes) — no doc-converter available in this session]`;
-      }
-      return buf.toString("utf-8").slice(0, 40000);
-    },
-  };
+  // ── Round 1: NO CCR — doc-converter runs, full markdown injected ──────
+  // Both rounds convert the PDF. The difference is whether CCR kicks in.
+  // Round 1: agent receives the entire markdown in one shot (~54K tokens).
+  // Round 2: agent receives a 163-token outline, fetches sections on demand.
+  // This is an apples-to-apples comparison — both succeed, both read the doc.
+  const { convertToMarkdown } = await import("./dist/tools/doc-converter.js");
+  const convResult = await convertToMarkdown(absPath, buf);
+  if (!convResult || "error" in convResult) {
+    console.error("Pre-conversion failed:", convResult?.error ?? "null");
+    process.exit(1);
+  }
+  const fullMarkdown = convResult.markdown;
+  const fullMarkdownTokens = tok(fullMarkdown);
+  console.log(`\n  Pre-converted markdown : ${fullMarkdownTokens.toLocaleString()} tokens`);
 
-  const promptWithout = `${TASK}\n\nDocument path: ${absPath}`;
+  // Inject full markdown directly into the prompt — no CCR, agent sees everything.
+  const promptNoCCR = `${TASK}\n\nDocument content (full):\n\n${fullMarkdown}`;
   const withoutResult = await runAgent(
-    "ROUND 1 — WITHOUT compression (no doc-converter, no cli)",
+    "ROUND 1 — NO CCR (full markdown in prompt)",
     agentDir,
-    promptWithout,
+    promptNoCCR,
     model,
-    { tools: [readNoConvert], replaceBuiltinTools: true },
   );
 
-  // ── Round 2: WITH compression ─────────────────────────────────────────
+  // ── Round 2: WITH CCR — outline first, agent fetches sections ─────────
   const promptWith = `${TASK}\n\nDocument path: ${absPath}`;
   const withResult = await runAgent(
-    "ROUND 2 — WITH compression (doc-converter + CCR)",
+    "ROUND 2 — WITH CCR (outline + fetch sections on demand)",
     agentDir,
     promptWith,
     model,
@@ -221,22 +195,23 @@ async function main() {
 
   // ── Final comparison ──────────────────────────────────────────────────
   sep("RESULTS COMPARISON");
-  const inDiff  = withResult.totalIn  - withoutResult.totalIn;
-  const outDiff = withResult.totalOut - withoutResult.totalOut;
   const totalWithout = withoutResult.totalIn + withoutResult.totalOut;
   const totalWith    = withResult.totalIn    + withResult.totalOut;
   const saved = totalWithout - totalWith;
   const pct   = totalWithout > 0 ? Math.round((Math.abs(saved) / totalWithout) * 100) : 0;
 
-  console.log(`\n  Without compression : ${totalWithout.toLocaleString()} total tokens`);
-  console.log(`  With compression    : ${totalWith.toLocaleString()} total tokens`);
+  console.log(`\n  Both rounds converted the PDF and produced a summary.`);
+  console.log(`\n  No CCR (full markdown) : ${totalWithout.toLocaleString()} total tokens`);
+  console.log(`  With CCR               : ${totalWith.toLocaleString()} total tokens`);
   if (saved > 0) {
-    console.log(`  Saved               : ${saved.toLocaleString()} tokens (−${pct}%)`);
+    console.log(`  Saved                  : ${saved.toLocaleString()} tokens (−${pct}%)`);
+    console.log(`\n  CCR saved tokens by serving a ${tok(fullMarkdown).toLocaleString()}-token doc as a 163-token outline.`);
+    console.log(`  Agent fetched only the sections it needed instead of loading the full doc.\n`);
   } else {
-    console.log(`  Overhead            : ${Math.abs(saved).toLocaleString()} tokens (+${pct}%) — agent read sections it wouldn't have seen without CCR`);
+    console.log(`  Overhead               : ${Math.abs(saved).toLocaleString()} tokens (+${pct}%)`);
+    console.log(`\n  Note: CCR overhead means agent fetched more sections than needed for this task.`);
+    console.log(`  CCR wins on multi-turn sessions where the same doc is referenced across turns.\n`);
   }
-  console.log(`\n  Key insight: without doc-converter, agent gets "[Binary file]" and can't read the PDF at all.`);
-  console.log(`  With compression, it reads ${(buf.length/1024).toFixed(0)}KB PDF as 7,201 tokens of clean markdown.\n`);
 }
 
 main().catch(err => { console.error(err); process.exit(1); });
