@@ -84,15 +84,10 @@ export function createReadTool(
 			const buffer = await readFile(absolutePath);
 
 			// ── Stage 1: Document conversion ──────────────────────────────
-			// Convert binary docs (PDF, DOCX, XLSX, PPTX) to markdown.
-			// Binary files that are NOT convertible return a placeholder.
-			if (isBinary(buffer)) {
-				if (!isConvertible(path)) {
-					return {
-						content: [{ type: "text", text: `[Binary file: ${path} (${buffer.length} bytes)]` }],
-						details: undefined,
-					};
-				}
+			// Check extension FIRST — some PDFs have no null bytes in the
+			// first 8KB so isBinary() returns false, but they're still not
+			// readable as plain text. Extension is the reliable signal.
+			if (isConvertible(path)) {
 
 				// Check cache first — skip conversion if cached copy is fresh
 				let markdown = await loadFromCache(cwd, absolutePath);
@@ -132,6 +127,14 @@ export function createReadTool(
 
 				return {
 					content: [{ type: "text", text: `[Converted from binary${cacheNote}]\n\n${markdown}` }],
+					details: undefined,
+				};
+			}
+
+			// ── Non-convertible binary files ──────────────────────────────
+			if (isBinary(buffer)) {
+				return {
+					content: [{ type: "text", text: `[Binary file: ${path} (${buffer.length} bytes)]` }],
 					details: undefined,
 				};
 			}
