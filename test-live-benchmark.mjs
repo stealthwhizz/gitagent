@@ -1,15 +1,21 @@
 /**
- * Live token benchmark: gitagent reads a PDF with and without compression.
+ * Live token benchmark: gitagent reads a PDF with and without CCR compression.
  *
  * Usage:
+ *   # Lyzr
  *   LYZR_API_KEY=sk-... LYZR_AGENT_ID=agent-... node test-live-benchmark.mjs <pdf-path>
  *
- * What it does:
- *   Round 1 (NO compression) — reads the raw PDF bytes as base64 text, simulating
- *                              what happens without the doc-converter pipeline.
- *   Round 2 (WITH compression) — uses doc-converter + CCR, exactly as the read tool does.
+ *   # Anthropic
+ *   ANTHROPIC_API_KEY=sk-ant-... node test-live-benchmark.mjs <pdf-path>
  *
- * Both rounds ask the same question. Token counts are printed after each.
+ *   # OpenAI
+ *   OPENAI_API_KEY=sk-... node test-live-benchmark.mjs <pdf-path>
+ *
+ * What it does:
+ *   Round 1 (NO CCR) — doc-converter runs, full markdown injected into prompt.
+ *   Round 2 (WITH CCR) — doc-converter runs, agent gets outline + fetches sections.
+ *
+ * Both rounds complete the task — token diff is the real CCR saving.
  */
 
 import { readFile } from "fs/promises";
@@ -21,16 +27,22 @@ if (!PDF_PATH) {
   process.exit(1);
 }
 
-const LYZR_API_KEY = process.env.LYZR_API_KEY;
-const LYZR_AGENT_ID = process.env.LYZR_AGENT_ID;
-
-if (!LYZR_API_KEY || !LYZR_AGENT_ID) {
-  console.error("Set LYZR_API_KEY and LYZR_AGENT_ID environment variables");
+// ── Detect provider from env vars ─────────────────────────────────────
+let model;
+if (process.env.LYZR_API_KEY && process.env.LYZR_AGENT_ID) {
+  process.env.OPENAI_API_KEY = process.env.LYZR_API_KEY;
+  model = `lyzr:${process.env.LYZR_AGENT_ID}@https://agent-prod.studio.lyzr.ai/v4`;
+  console.log("  Provider : Lyzr AI");
+} else if (process.env.ANTHROPIC_API_KEY) {
+  model = "anthropic:claude-sonnet-4-6";
+  console.log("  Provider : Anthropic");
+} else if (process.env.OPENAI_API_KEY) {
+  model = "openai:gpt-4o";
+  console.log("  Provider : OpenAI");
+} else {
+  console.error("Set one of: LYZR_API_KEY+LYZR_AGENT_ID, ANTHROPIC_API_KEY, or OPENAI_API_KEY");
   process.exit(1);
 }
-
-// pi-ai needs OPENAI_API_KEY for its internal key lookup
-process.env.OPENAI_API_KEY = LYZR_API_KEY;
 
 const TASK = `Read the document at the path given and give me a 5-bullet summary of the most important points.`;
 
@@ -123,7 +135,6 @@ async function runAgent(label, dir, prompt, model, opts = {}) {
 async function main() {
   const absPath = resolve(PDF_PATH);
   const filename = basename(absPath);
-  const model = `lyzr:${LYZR_AGENT_ID}@https://agent-prod.studio.lyzr.ai/v4`;
 
   // Use the assistant agent dir (has agent.yaml, SOUL.md, RULES.md)
   const agentDir = resolve("./agents/assistant");
@@ -165,7 +176,6 @@ async function main() {
   // Round 1: agent receives the entire markdown in one shot (~54K tokens).
   // Round 2: agent receives a 163-token outline, fetches sections on demand.
   // This is an apples-to-apples comparison — both succeed, both read the doc.
-  const { convertToMarkdown } = await import("./dist/tools/doc-converter.js");
   const convResult = await convertToMarkdown(absPath, buf);
   if (!convResult || "error" in convResult) {
     console.error("Pre-conversion failed:", convResult?.error ?? "null");
