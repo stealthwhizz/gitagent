@@ -44,7 +44,7 @@ function sep(title) {
 }
 
 // ── Round helper: runs the agent, streams output, returns usage ────────
-async function runAgent(label, dir, prompt, model) {
+async function runAgent(label, dir, prompt, model, opts = {}) {
   const { query } = await import("./dist/exports.js");
 
   sep(label);
@@ -55,6 +55,7 @@ async function runAgent(label, dir, prompt, model) {
     model,
     maxTurns: 10,
     constraints: { maxTokens: 1000 },
+    ...opts,
   });
 
   let totalIn = 0, totalOut = 0, totalReqs = 0;
@@ -160,23 +161,54 @@ async function main() {
   }
 
   // ── Round 1: WITHOUT compression ─────────────────────────────────────
-  // Agent reads the PDF but gets "[Binary file]" — no doc-converter.
-  // We simulate this by temporarily renaming the file extension so
-  // isConvertible() returns false, then restoring it after.
-  const { rename } = await import("fs/promises");
-  const fakePath = absPath.replace(/\.pdf$/i, ".bin");
-  await rename(absPath, fakePath);
+  // Simulate no doc-converter by providing ONLY the read tool (no cli).
+  // This prevents the agent routing around the binary via pdftotext or
+  // other shell tools — which is what happens on Mac/Linux in the wild.
+  // The agent will call read(), get "[Binary file]", and be stuck.
+  // createReadTool with NO docStore → no CCR, no doc-converter (isConvertible
+  // still triggers but we pass no costTracker so agent just gets [Binary file]
+  // for the .pdf because the old read.ts on main would return that).
+  // Simpler: we patch by giving the agent only a stripped read that returns
+  // [Binary file] for any binary — achieved by passing no docStore and using
+  // the original isBinary-only path. Since we're on feat/compression the read
+  // tool now checks isConvertible first, so to truly simulate "no feature" we
+  // wrap a custom tool.
+  // Disable cli + read_doc_section so agent can't route around the missing
+  // doc-converter via pdftotext or other shell tools.
+  // Also inject a custom "read" that blocks convertible formats — simulating
+  // the old read.ts behaviour before doc-converter existed.
+  const readNoConvert = {
+    name: "read",
+    description: "Read a file. PDF/DOCX/XLSX/PPTX files are not supported — returns a placeholder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        offset: { type: "number" },
+        limit: { type: "number" },
+      },
+      required: ["path"],
+    },
+    handler: async ({ path: filePath }) => {
+      const { readFile } = await import("fs/promises");
+      const { resolve } = await import("path");
+      const buf = await readFile(resolve(agentDir, filePath)).catch(() => null);
+      if (!buf) return `[File not found: ${filePath}]`;
+      if (/\.(pdf|docx|xlsx|pptx)$/i.test(filePath)) {
+        return `[Binary file: ${filePath} (${buf.length} bytes) — no doc-converter available in this session]`;
+      }
+      return buf.toString("utf-8").slice(0, 40000);
+    },
+  };
 
-  const promptWithout = `${TASK}\n\nDocument path: ${fakePath}`;
+  const promptWithout = `${TASK}\n\nDocument path: ${absPath}`;
   const withoutResult = await runAgent(
-    "ROUND 1 — WITHOUT compression (returns [Binary file])",
+    "ROUND 1 — WITHOUT compression (no doc-converter, no cli)",
     agentDir,
     promptWithout,
     model,
+    { tools: [readNoConvert], replaceBuiltinTools: true },
   );
-
-  // Restore original filename
-  await rename(fakePath, absPath);
 
   // ── Round 2: WITH compression ─────────────────────────────────────────
   const promptWith = `${TASK}\n\nDocument path: ${absPath}`;
